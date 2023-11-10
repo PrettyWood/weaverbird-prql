@@ -36,6 +36,7 @@ enum PipelineStep {
 #[serde(rename_all = "lowercase")]
 enum Dialect {
     Postgres,
+    BigQuery,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -58,6 +59,7 @@ impl Request {
     fn to_sql(&self) -> Result<String, ErrorMessages> {
         let target = match self.dialect {
             Dialect::Postgres => Target::Sql(Some(prql_compiler::sql::Dialect::Postgres)),
+            Dialect::BigQuery => Target::Sql(Some(prql_compiler::sql::Dialect::BigQuery)),
         };
         let opts = Options {
             format: false,
@@ -90,10 +92,14 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
-    #[test]
-    fn domain_table() {
+    #[rstest]
+    #[case::postgres("postgres")]
+    #[case::bigquery("bigquery")]
+    fn domain_table(#[case] dialect: &str) {
         let request = json!(
         {
             "pipeline": [
@@ -103,15 +109,17 @@ mod tests {
                     "table": true,
                 }
             ],
-            "dialect": "postgres"
+            "dialect": dialect
         });
         let request: Request = serde_json::from_value(request).unwrap();
         assert_eq!(request.to_prql(), "from `albums`");
-        assert_eq!(request.to_sql().unwrap(), r#"SELECT * FROM albums"#);
+        assert_eq!(request.to_sql().unwrap(), "SELECT * FROM albums");
     }
 
-    #[test]
-    fn domain_table_with_whitespace() {
+    #[rstest]
+    #[case::postgres("postgres", "SELECT * FROM \"al bums\"")]
+    #[case::bigquery("bigquery", "SELECT * FROM `al bums`")]
+    fn domain_table_with_whitespace(#[case] dialect: &str, #[case] sql: &str) {
         let request = json!(
         {
             "pipeline": [
@@ -121,15 +129,17 @@ mod tests {
                     "table": true,
                 }
             ],
-            "dialect": "postgres"
+            "dialect": dialect
         });
         let request: Request = serde_json::from_value(request).unwrap();
         assert_eq!(request.to_prql(), "from `al bums`");
-        assert_eq!(request.to_sql().unwrap(), r#"SELECT * FROM "al bums""#);
+        assert_eq!(request.to_sql().unwrap(), sql);
     }
 
-    #[test]
-    fn domain_custom_query() {
+    #[rstest]
+    #[case::postgres("postgres")]
+    #[case::bigquery("bigquery")]
+    fn domain_custom_query(#[case] dialect: &str) {
         let request = json!(
         {
             "pipeline": [
@@ -139,7 +149,7 @@ mod tests {
                     "table": false,
                 }
             ],
-            "dialect": "postgres"
+            "dialect": dialect
         });
         let request: Request = serde_json::from_value(request).unwrap();
         assert_eq!(request.to_prql(), r#"from s"SELECT * FROM sales""#);
