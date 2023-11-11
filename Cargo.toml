@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.75"
 enum_dispatch = "0.3.12"
+pretty_assertions = "1.4.0"
 prql-compiler = "0.10.0"
 rstest = "0.18.2"
 serde = "1.0.192"
