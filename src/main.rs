@@ -1,391 +1,44 @@
 use anyhow::Result;
 use axum::{routing::post, Json, Router};
-use enum_dispatch::enum_dispatch;
 use prql_compiler::{compile, ErrorMessages, Options, Target};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::iter::zip;
 
-#[enum_dispatch]
-trait ToPrql {
-    fn to_prql(&self, dialect: &Dialect) -> Result<String>;
+mod pipeline;
+mod translate;
+
+use pipeline::Pipeline;
+use translate::{Dialect, ToPrql};
+
+#[tokio::main]
+async fn main() {
+    let app = Router::new()
+        .route("/prql", post(to_prql))
+        .route("/sql", post(to_sql));
+    axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
 }
 
-#[enum_dispatch]
-trait ToSString {
-    fn to_s_string(&self, dialect: &Dialect) -> Result<String, ErrorMessages>;
+async fn to_prql(Json(request): Json<Request>) -> String {
+    request
+        .to_prql()
+        .expect("Could not convert request to PRQL")
 }
 
-impl ToSString for Value {
-    fn to_s_string(&self, dialect: &Dialect) -> Result<String, ErrorMessages> {
-        // We need to use single quotes for values in s-strings
-        // (see https://prql-lang.org/book/reference/syntax/s-strings.html#admonition-note)
-        let single_quote_replacement = match dialect {
-            Dialect::Postgres => "''",
-            Dialect::BigQuery => r#"\\'"#,
-        };
-        match self {
-            Value::String(s) => Ok(format!("\'{}\'", s.replace('\'', single_quote_replacement))),
-            _ => Ok(self.to_string()),
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct Column(String);
-
-impl ToPrql for Column {
-    fn to_prql(&self, _dialect: &Dialect) -> Result<String> {
-        Ok(format!("`{}`", self.0))
-    }
-}
-
-impl ToSString for Column {
-    fn to_s_string(&self, dialect: &Dialect) -> Result<String, ErrorMessages> {
-        match dialect {
-            Dialect::Postgres => Ok(format!(r#"\"{}\""#, self.0)),
-            Dialect::BigQuery => Ok(format!("`{}`", self.0)),
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct DomainStep {
-    domain: String,
-    table: bool,
-}
-
-impl ToPrql for DomainStep {
-    // https://prql-lang.org/book/reference/stdlib/transforms/from.html
-    fn to_prql(&self, dialect: &Dialect) -> Result<String> {
-        if self.table {
-            Ok(format!(
-                "from {}",
-                Column(self.domain.clone()).to_prql(dialect)?
-            ))
-        } else {
-            // https://prql-lang.org/book/reference/syntax/s-strings.html
-            Ok(format!("from s\"{}\"", self.domain))
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct AggregateStep {
-    #[serde(default)]
-    on: Vec<Column>,
-    aggregations: Vec<Aggregation>,
-    #[serde(rename = "keepOriginalGranularity")]
-    #[serde(default)]
-    keep_original_granularity: bool,
-}
-
-impl ToPrql for AggregateStep {
-    // https://prql-lang.org/book/reference/stdlib/transforms/aggregate.html
-    fn to_prql(&self, dialect: &Dialect) -> Result<String> {
-        match (self.on.len(), self.keep_original_granularity) {
-            (0, false) => Ok(format!(
-                "aggregate {{ {} }}",
-                self.aggregations
-                    .iter()
-                    .map(|agg| agg.to_prql(dialect))
-                    .collect::<Result<Vec<String>>>()?
-                    .join(", ")
-            )),
-            (0, true) => Ok(format!(
-                "derive {{ {} }}",
-                self.aggregations
-                    .iter()
-                    .map(|agg| agg.to_prql(dialect))
-                    .collect::<Result<Vec<String>>>()?
-                    .join(", ")
-            )),
-            (_, false) => Ok(format!(
-                "group {{ {} }} ( aggregate {{ {} }} )",
-                self.on
-                    .iter()
-                    .map(|col| col.to_prql(dialect))
-                    .collect::<Result<Vec<String>>>()?
-                    .join(", "),
-                self.aggregations
-                    .iter()
-                    .map(|agg| agg.to_prql(dialect))
-                    .collect::<Result<Vec<String>>>()?
-                    .join(", ")
-            )),
-            (_, true) => Ok(format!(
-                // https://prql-lang.org/book/reference/stdlib/transforms/window.html
-                "group {{ {} }} ( window rows:.. ( derive {{ {} }} ) )",
-                self.on
-                    .iter()
-                    .map(|col| col.to_prql(dialect))
-                    .collect::<Result<Vec<String>>>()?
-                    .join(", "),
-                self.aggregations
-                    .iter()
-                    .map(|agg| agg.to_prql(dialect))
-                    .collect::<Result<Vec<String>>>()?
-                    .join(", ")
-            )),
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct Aggregation {
-    pub columns: Vec<Column>,
-    #[serde(rename = "newcolumns")]
-    pub new_columns: Vec<Column>,
-    #[serde(rename = "aggfunction")]
-    pub function: AggregationFn,
-}
-
-impl ToPrql for Aggregation {
-    fn to_prql(&self, dialect: &Dialect) -> Result<String> {
-        Ok(zip(&self.columns, &self.new_columns)
-            .map(|(col, new_col)| {
-                Ok(format!(
-                    "{} = {} {}",
-                    new_col.to_prql(dialect)?,
-                    self.function.to_prql(dialect)?,
-                    col.to_prql(dialect).unwrap(),
-                ))
-            })
-            .collect::<Result<Vec<String>>>()?
-            .join(", "))
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "lowercase")]
-enum AggregationFn {
-    Min,
-    Max,
-    Count,
-    Avg,
-    Sum,
-    #[serde(rename = "count distinct")]
-    CountDistinct,
-    First,
-    Last,
-}
-
-impl ToPrql for AggregationFn {
-    fn to_prql(&self, _dialect: &Dialect) -> Result<String> {
-        Ok(match self {
-            AggregationFn::Min => "min",
-            AggregationFn::Max => "max",
-            AggregationFn::Count => "count",
-            AggregationFn::Avg => "avg",
-            AggregationFn::Sum => "sum",
-            AggregationFn::CountDistinct => "count_distinct",
-            // https://prql-lang.org/book/reference/stdlib/transforms/aggregate.html#admonition-note
-            // Those two are not implemented in PRQL, but we can use min and max
-            AggregationFn::First => "min",
-            AggregationFn::Last => "max",
-        }
-        .to_string())
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct FilterStep {
-    condition: Condition,
-}
-
-impl ToPrql for FilterStep {
-    // https://prql-lang.org/book/reference/stdlib/transforms/filter.html
-    fn to_prql(&self, dialect: &Dialect) -> Result<String> {
-        Ok(format!("filter {}", self.condition.to_prql(dialect)?))
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(untagged)]
-#[enum_dispatch(ToPrql)]
-enum Condition {
-    Simple(SimpleCondition),
-    Or(OrCondition),
-    And(AndCondition),
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(untagged)]
-#[enum_dispatch(ToPrql)]
-enum SimpleCondition {
-    Comparison(ComparisonCondition),
-    Nullability(NullabilityCondition),
-    Inclusion(InclusionCondition),
-    // Matches(MatchesCondition),
-    // Date(DateCondition),
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct ComparisonCondition {
-    column: Column,
-    operator: ComparisonOperator,
-    value: Value,
-}
-
-impl ToPrql for ComparisonCondition {
-    fn to_prql(&self, dialect: &Dialect) -> Result<String> {
-        let op = match self.operator {
-            ComparisonOperator::Eq => "==",
-            ComparisonOperator::Ne => "!=",
-            ComparisonOperator::Gt => ">",
-            ComparisonOperator::Gte => ">=",
-            ComparisonOperator::Lt => "<",
-            ComparisonOperator::Lte => "<=",
-        };
-        Ok(format!(
-            "{} {} {}",
-            self.column.to_prql(dialect)?,
-            op,
-            self.value
-        ))
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "lowercase")]
-enum ComparisonOperator {
-    Eq,
-    Ne,
-    Gt,
-    Gte,
-    Lt,
-    Lte,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct NullabilityCondition {
-    column: Column,
-    #[serde(rename = "operator")]
-    operator: NullabilityOperator,
-}
-
-impl ToPrql for NullabilityCondition {
-    fn to_prql(&self, dialect: &Dialect) -> Result<String> {
-        match self.operator {
-            NullabilityOperator::IsNull => Ok(format!("{} == null", self.column.to_prql(dialect)?)),
-            NullabilityOperator::NotNull => {
-                Ok(format!("{} != null", self.column.to_prql(dialect)?))
-            }
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "lowercase")]
-enum NullabilityOperator {
-    IsNull,
-    NotNull,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct InclusionCondition {
-    column: Column,
-    #[serde(rename = "operator")]
-    operator: InclusionOperator,
-    value: Vec<Value>,
-}
-
-impl ToPrql for InclusionCondition {
-    // IN is not yet supported in PRQL (see https://github.com/PRQL/prql/issues/993)
-    // We hence rely on s-strings (https://prql-lang.org/book/reference/syntax/s-strings.html)
-    fn to_prql(&self, dialect: &Dialect) -> Result<String> {
-        let joined_values = self
-            .value
-            .iter()
-            .map(|v| v.to_s_string(dialect))
-            .collect::<Result<Vec<String>, ErrorMessages>>()
-            .map(|v| v.join(", "));
-        match self.operator {
-            InclusionOperator::In => Ok(format!(
-                r#"s"{} IN ({})""#,
-                self.column.to_s_string(dialect)?,
-                joined_values?
-            )),
-            InclusionOperator::Nin => Ok(format!(
-                r#"s"{} NOT IN ({})""#,
-                self.column.to_s_string(dialect)?,
-                joined_values?
-            )),
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "lowercase")]
-enum InclusionOperator {
-    In,
-    Nin,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct OrCondition {
-    or: Vec<Condition>,
-}
-
-impl ToPrql for OrCondition {
-    fn to_prql(&self, dialect: &Dialect) -> Result<String> {
-        Ok(format!(
-            "({})",
-            self.or
-                .iter()
-                .map(|condition| condition.to_prql(dialect))
-                .collect::<Result<Vec<String>>>()?
-                .join(" || ")
-        ))
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct AndCondition {
-    and: Vec<Condition>,
-}
-
-impl ToPrql for AndCondition {
-    fn to_prql(&self, dialect: &Dialect) -> Result<String> {
-        Ok(self
-            .and
-            .iter()
-            .map(|condition| condition.to_prql(dialect))
-            .collect::<Result<Vec<String>>>()?
-            .join(" && "))
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(tag = "name", rename_all = "lowercase")]
-#[enum_dispatch(ToPrql)]
-enum PipelineStep {
-    Domain(DomainStep),
-    Aggregate(AggregateStep),
-    Filter(FilterStep),
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "lowercase")]
-enum Dialect {
-    Postgres,
-    BigQuery,
+async fn to_sql(Json(request): Json<Request>) -> String {
+    request.to_sql().expect("Could not convert request to SQL")
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Request {
-    pipeline: Vec<PipelineStep>,
+    pipeline: Pipeline,
     dialect: Dialect,
 }
 
 impl Request {
     fn to_prql(&self) -> Result<String> {
-        Ok(self
-            .pipeline
-            .iter()
-            .map(|step| step.to_prql(&self.dialect))
-            .collect::<Result<Vec<String>>>()?
-            .join(" | "))
+        self.pipeline.to_prql(&self.dialect)
     }
 
     fn to_sql(&self) -> Result<String, ErrorMessages> {
@@ -401,27 +54,6 @@ impl Request {
         };
         compile(&self.to_prql()?, &opts)
     }
-}
-
-async fn to_prql(Json(request): Json<Request>) -> String {
-    request
-        .to_prql()
-        .expect("Could not convert request to PRQL")
-}
-
-async fn to_sql(Json(request): Json<Request>) -> String {
-    request.to_sql().expect("Could not convert request to SQL")
-}
-
-#[tokio::main]
-async fn main() {
-    let app = Router::new()
-        .route("/prql", post(to_prql))
-        .route("/sql", post(to_sql));
-    axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
-        .serve(app.into_make_service())
-        .await
-        .unwrap();
 }
 
 #[cfg(test)]
@@ -473,58 +105,35 @@ mod tests {
     }
 
     #[rstest]
-    #[case::postgres("postgres")]
-    #[case::bigquery("bigquery")]
-    fn domain_custom_query(#[case] dialect: &str) {
-        let request = json!(
-        {
-            "pipeline": [
-                {
-                    "name": "domain",
-                    "domain": "SELECT * FROM sales",
-                    "table": false,
-                }
-            ],
-            "dialect": dialect
-        });
-        let request: Request = serde_json::from_value(request).unwrap();
-        assert_eq!(request.to_prql().unwrap(), r#"from s"SELECT * FROM sales""#);
-        assert_eq!(
-            request.to_sql().unwrap(),
-            "WITH table_0 AS (SELECT * FROM sales) SELECT * FROM table_0"
-        );
-    }
-
-    #[rstest]
     #[case::postgres("postgres", r#"SELECT MIN("City") AS "City", COALESCE(SUM("Price"), 0) AS "Price_sum", COALESCE(SUM("Quantity"), 0) AS "Somme des quantités" FROM "al bums""#)]
     #[case::bigquery("bigquery", "SELECT MIN(`City`) AS `City`, COALESCE(SUM(`Price`), 0) AS `Price_sum`, COALESCE(SUM(`Quantity`), 0) AS `Somme des quantités` FROM `al bums`")]
     fn aggregation_group_no_keep_no(#[case] dialect: &str, #[case] sql: &str) {
         let request = json!(
-        {
-            "pipeline": [
                 {
-                    "name": "domain",
-                    "domain": "al bums",
-                    "table": true,
-                },
-                {
-                    "name": "aggregate",
-                    "aggregations": [
-                        {
-                            "columns": ["City"],
-                            "newcolumns": ["City"],
-                            "aggfunction": "first",
-                        },
-                        {
-                            "columns": ["Price", "Quantity"],
-                            "newcolumns": ["Price_sum", "Somme des quantités"],
-                            "aggfunction": "sum",
-                        },
-                    ],
-                }
-            ],
-            "dialect": dialect,
-        });
+        "pipeline": [
+            {
+                "name": "domain",
+                "domain": "al bums",
+                "table": true,
+            },
+            {
+                "name": "aggregate",
+                "aggregations": [
+                    {
+                        "columns": ["City"],
+                        "newcolumns": ["City"],
+                        "aggfunction": "first",
+                    },
+                    {
+                        "columns": ["Price", "Quantity"],
+                        "newcolumns": ["Price_sum", "Somme des quantités"],
+                        "aggfunction": "sum",
+                    },
+                ],
+            }
+        ],
+                    "dialect": dialect,
+                });
         let request: Request = serde_json::from_value(request).unwrap();
         assert_eq!(
             request.to_prql().unwrap(),
