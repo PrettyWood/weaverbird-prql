@@ -1,8 +1,9 @@
 use anyhow::Result;
+use axum::{routing::post, Json, Router};
 use enum_dispatch::enum_dispatch;
 use prql_compiler::{compile, ErrorMessages, Options, Target};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::iter::zip;
 
 #[enum_dispatch]
@@ -402,37 +403,32 @@ impl Request {
     }
 }
 
-fn main() -> Result<()> {
-    // let prql = "from albums | select {title, artist_id}";
-    let request = json!(
-    {
-        "pipeline": [
-            {
-                "name": "domain",
-                "domain": "al bums",
-                "table": true,
-            },
-            {
-                "name": "filter",
-                "condition": {
-                  "column": "my-column",
-                  "value": 42,
-                  "operator": "ne"
-                }
-            }
-        ],
-        "dialect": "postgres"
-    });
-    let request: Request = serde_json::from_value(request)?;
-    println!("PRQL: {}", request.to_prql().unwrap());
-    println!("SQL: {}", request.to_sql().unwrap());
-    Ok(())
+async fn to_prql(Json(request): Json<Request>) -> String {
+    request
+        .to_prql()
+        .expect("Could not convert request to PRQL")
+}
+
+async fn to_sql(Json(request): Json<Request>) -> String {
+    request.to_sql().expect("Could not convert request to SQL")
+}
+
+#[tokio::main]
+async fn main() {
+    let app = Router::new()
+        .route("/prql", post(to_prql))
+        .route("/sql", post(to_sql));
+    axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
 }
 
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
     use rstest::rstest;
+    use serde_json::json;
 
     use super::*;
 
