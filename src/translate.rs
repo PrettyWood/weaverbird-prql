@@ -40,7 +40,7 @@ impl ToSString for Column {
     }
 }
 
-impl ToSString for Value {
+impl ToSString for String {
     fn to_s_string(&self, dialect: &Dialect) -> Result<String> {
         // We need to use single quotes for values in s-strings
         // (see https://prql-lang.org/book/reference/syntax/s-strings.html#admonition-note)
@@ -48,8 +48,17 @@ impl ToSString for Value {
             Dialect::Postgres => "''",
             Dialect::BigQuery => r#"\\'"#,
         };
+        Ok(format!(
+            "\'{}\'",
+            self.replace('\'', single_quote_replacement)
+        ))
+    }
+}
+
+impl ToSString for Value {
+    fn to_s_string(&self, dialect: &Dialect) -> Result<String> {
         match self {
-            Value::String(s) => Ok(format!("\'{}\'", s.replace('\'', single_quote_replacement))),
+            Value::String(s) => Ok(s.to_s_string(dialect)?),
             _ => Ok(self.to_string()),
         }
     }

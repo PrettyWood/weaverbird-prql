@@ -39,7 +39,7 @@ enum SimpleCondition {
     Comparison(ComparisonCondition),
     Nullability(NullabilityCondition),
     Inclusion(InclusionCondition),
-    // Matches(MatchesCondition),
+    Matches(MatchesCondition),
     // Date(DateCondition),
 }
 
@@ -50,7 +50,7 @@ impl ToPrql for SimpleCondition {
             SimpleCondition::Comparison(condition) => condition.to_prql(dialect),
             SimpleCondition::Nullability(condition) => condition.to_prql(dialect),
             SimpleCondition::Inclusion(condition) => condition.to_prql(dialect),
-            // SimpleCondition::Matches(condition) => condition.to_prql(dialect),
+            SimpleCondition::Matches(condition) => condition.to_prql(dialect),
             // SimpleCondition::Date(condition) => condition.to_prql(dialect),
         }
     }
@@ -96,7 +96,6 @@ enum ComparisonOperator {
 #[derive(Serialize, Deserialize, Debug)]
 struct NullabilityCondition {
     column: Column,
-    #[serde(rename = "operator")]
     operator: NullabilityOperator,
 }
 
@@ -121,7 +120,6 @@ enum NullabilityOperator {
 #[derive(Serialize, Deserialize, Debug)]
 struct InclusionCondition {
     column: Column,
-    #[serde(rename = "operator")]
     operator: InclusionOperator,
     value: Vec<Value>,
 }
@@ -156,6 +154,47 @@ impl ToPrql for InclusionCondition {
 enum InclusionOperator {
     In,
     Nin,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct MatchesCondition {
+    column: Column,
+    operator: MatchesOperator,
+    value: String,
+}
+
+impl ToPrql for MatchesCondition {
+    fn to_prql(&self, dialect: &Dialect) -> Result<String> {
+        match (&self.operator, dialect) {
+            (MatchesOperator::Matches, Dialect::Postgres) => Ok(format!(
+                r#"s"{} SIMILAR TO {}""#,
+                self.column.to_s_string(dialect)?,
+                self.value.to_s_string(dialect)?,
+            )),
+            (MatchesOperator::NotMatches, Dialect::Postgres) => Ok(format!(
+                r#"s"{} NOT SIMILAR TO {}""#,
+                self.column.to_s_string(dialect)?,
+                self.value.to_s_string(dialect)?,
+            )),
+            (MatchesOperator::Matches, Dialect::BigQuery) => Ok(format!(
+                r#"s"REGEXP_CONTAINS({},{})""#,
+                self.column.to_s_string(dialect)?,
+                self.value.to_s_string(dialect)?,
+            )),
+            (MatchesOperator::NotMatches, Dialect::BigQuery) => Ok(format!(
+                r#"s"NOT REGEXP_CONTAINS({},{})""#,
+                self.column.to_s_string(dialect)?,
+                self.value.to_s_string(dialect)?,
+            )),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "lowercase")]
+enum MatchesOperator {
+    Matches,
+    NotMatches,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -327,6 +366,42 @@ mod tests {
                             }
                         ]
                     }
+                ]
+            }
+        });
+        assert_eq!(
+            serde_json::from_value::<FilterStep>(input)
+                .unwrap()
+                .to_prql(&dialect)
+                .unwrap(),
+            prql
+        );
+    }
+
+    #[rstest]
+    #[case::postgres(
+        Dialect::Postgres,
+        r#"filter s"\"val1\" SIMILAR TO 'pika'" && s"\"val2\" NOT SIMILAR TO 'chu'""#
+    )]
+    #[case::bigquery(
+        Dialect::BigQuery,
+        r#"filter s"REGEXP_CONTAINS(`val1`,'pika')" && s"NOT REGEXP_CONTAINS(`val2`,'chu')""#
+    )]
+    fn filter_complex_2(#[case] dialect: Dialect, #[case] prql: &str) {
+        let input = json!(
+        {
+            "condition": {
+                "and": [
+                    {
+                        "column": "val1",
+                        "operator": "matches",
+                        "value": "pika",
+                    },
+                    {
+                        "column": "val2",
+                        "operator": "notmatches",
+                        "value": "chu",
+                    },
                 ]
             }
         });
